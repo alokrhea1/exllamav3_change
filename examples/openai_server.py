@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-openai_server.py – expose exllamav3 as an OpenAI‑compatible REST API
+openai_server.py – expose exllamav3 as an OpenAI-compatible REST API
 --------------------------------------------------------------------
-• /v1/models            – minimal model list (2024‑12‑01 schema)
-• /v1/chat/completions  – chat endpoint (stream / non‑stream)
-• /v1/completions       – plain completion endpoint (stream / non‑stream)
+• /v1/models            – minimal model list (2024-12-01 schema)
+• /v1/chat/completions  – chat endpoint (stream / non-stream)
+• /v1/completions       – plain completion endpoint (stream / non-stream)
 
-Drop‑in for Mikupad (or any client that speaks the official OpenAI spec).
+Drop-in for Mikupad (or any client that speaks the official OpenAI spec).
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from typing import List, Optional, Generator as TypingGen
 import torch  # noqa – required by exllamav3
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware  # ← NEW
 from pydantic import BaseModel, Field
 import uvicorn
 
@@ -29,7 +30,7 @@ from chat_templates import prompt_formats  # noqa
 # ------------------------------------------------------------------ CLI args
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Run exllamav3 as an OpenAI‑style server")
+    p = argparse.ArgumentParser(description="Run exllamav3 as an OpenAI-style server")
     model_init.add_args(p, cache=True)  # brings in --model_dir, dtype flags, etc.
 
     # minimal inference controls
@@ -168,6 +169,15 @@ class ExLlamaEngine:
 def create_app(engine: ExLlamaEngine) -> FastAPI:
     app = FastAPI()
 
+    # --------------- NEW: Enable CORS for any origin / method / header
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     # ----------------------------------------------------------- /v1/models
     @app.get("/v1/models")
     async def list_models():
@@ -224,7 +234,7 @@ def create_app(engine: ExLlamaEngine) -> FastAPI:
 
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-        # NON‑STREAM ---------------------------------------------------
+        # NON-STREAM ---------------------------------------------------
         text = "".join(engine.generate(prompt, sampler, max_tok, stream=False))
         now = int(time.time())
         completion_tokens = engine.tokenizer.encode(text).shape[-1]
@@ -282,7 +292,7 @@ def create_app(engine: ExLlamaEngine) -> FastAPI:
                 yield "data: [DONE]\n\n"
             return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-        # NON‑STREAM ---------------------------------------------------
+        # NON-STREAM ---------------------------------------------------
         text = "".join(engine.generate(prompt, sampler, max_tok, stream=False))
         now = int(time.time())
         completion_tokens = engine.tokenizer.encode(text).shape[-1]
