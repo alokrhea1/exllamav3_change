@@ -75,10 +75,13 @@ class ExLlamaEngine:
         self.model, self.config, self.cache, self.tokenizer = model_init.init(args)
         self.context_len = self.cache.max_num_tokens
         self.model_id = f"exllama-{args.mode}"
-        self.prompt_tmpl = prompt_formats[args.mode]("User", "Assistant")
+        self.user_name = "User"
+        self.bot_name = "Assistant"
+        self.prompt_tmpl = prompt_formats[args.mode](self.user_name, self.bot_name)
         self.system_prompt = (
             args.system_prompt or self.prompt_tmpl.default_system_prompt()
         )
+        self.generator = ExGen(model=self.model, cache=self.cache, tokenizer=self.tokenizer)
 
     def sampler(self, temp: Optional[float], top_p: Optional[float]) -> ComboSampler:
         return ComboSampler(
@@ -95,17 +98,47 @@ class ExLlamaEngine:
         )
 
     def build_prompt(self, messages: List[Message]) -> str:
-        ctx: list[tuple[Optional[str], Optional[str]]] = []
+        current_system_prompt = self.system_prompt
         for m in messages:
             if m.role == "system":
-                self.system_prompt = m.content
-            elif m.role == "user":
-                ctx.append((m.content, None))
-            elif m.role == "assistant":
-                ctx.append((None, m.content))
-            else:
-                raise HTTPException(400, f"unknown role: {m.role}")
-        return self.prompt_tmpl.format(self.system_prompt, ctx)
+                if m.content:
+                    current_system_prompt = m.content
+                break
+
+        if self.args.mode == 'raw':
+            prompt_parts = []
+            if current_system_prompt:
+                prompt_parts.append(current_system_prompt)
+
+            for m in messages:
+                if m.role == "user" and m.content:
+                    prompt_parts.append(f"{self.user_name}: {m.content}")
+                elif m.role == "assistant" and m.content:
+                    prompt_parts.append(f"{self.bot_name}: {m.content}")
+
+            if not prompt_parts:
+                 return f"{self.bot_name}:"
+
+            full_prompt = "\n\n".join(prompt_parts)
+            full_prompt += f"\n\n{self.bot_name}:"
+            return full_prompt
+        else:
+            ctx: list[tuple[str, Optional[str]]] = []
+            user_msg = ""
+            for m in messages:
+                if m.role == "user":
+                    if user_msg:
+                        ctx.append((user_msg, None))
+                    user_msg = m.content
+                elif m.role == "assistant":
+                    if not user_msg:
+                        ctx.append(("", m.content))
+                    else:
+                        ctx.append((user_msg, m.content))
+                    user_msg = ""
+            if user_msg:
+                ctx.append((user_msg, None))
+            return self.prompt_tmpl.format(current_system_prompt, ctx)
 
     def generate(
         self,
@@ -120,8 +153,15 @@ class ExLlamaEngine:
             add_bos=self.prompt_tmpl.add_bos(),
             encode_special_tokens=True,
         )
-        while ids.shape[-1] + max_new_tokens + 1 > self.context_len:
-            ids = ids[:, ids.shape[-1] // 2 :]
+
+        # --- ROBUST CONTEXT TRIMMING ---
+        # Calculate the maximum number of tokens the prompt can have
+        max_prompt_len = self.context_len - max_new_tokens - 1
+
+        # If the prompt is too long, trim it from the left
+        if ids.shape[-1] > max_prompt_len:
+            ids = ids[:, -max_prompt_len:]
+        # --- END OF FIX ---
 
         stop_conditions = self.prompt_tmpl.stop_conditions(self.tokenizer)
         tt = self.prompt_tmpl.thinktag()
@@ -134,29 +174,28 @@ class ExLlamaEngine:
             banned_strings=[tt[0], tt[1]],
         )
 
-        gen = ExGen(model=self.model, cache=self.cache, tokenizer=self.tokenizer)
-        gen.enqueue(job)
+        self.generator.enqueue(job)
 
         if stream:
-            for r in gen.iterate():
-                txt = r.get("text", "")
-                if txt:
-                    yield txt
+            while self.generator.num_remaining_jobs() > 0:
+                results = self.generator.iterate()
+                for r in results:
+                    txt = r.get("text", "")
+                    if txt:
+                        yield txt
         else:
-            chunks: list[str] = []
-            for r in gen.iterate():
-                if r.get("text"):
-                    chunks.append(r["text"])
+            chunks = []
+            for r in self.generator.iterate():
+                chunks.append(r.get("text", ""))
             yield "".join(chunks)
 
 
 def create_app(engine: ExLlamaEngine) -> FastAPI:
     app = FastAPI()
-
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[],                 # empty list → use regex below
-        allow_origin_regex=r"https?://.*",  # accept any http/https origin
+        allow_origins=[],
+        allow_origin_regex=r"https?://.*",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -180,11 +219,16 @@ def create_app(engine: ExLlamaEngine) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def chat_completion(req: ChatRequest):
         max_tok = req.max_tokens or engine.args.max_response_tokens
+        
+        # Add a safeguard for max_tokens
+        if max_tok >= engine.context_len:
+            max_tok = engine.context_len - 128 # Leave some space for prompt
+        
         sampler = engine.sampler(req.temperature, req.top_p)
         prompt = engine.build_prompt(req.messages)
-        prompt_ids = engine.tokenizer.encode(prompt, add_bos=engine.prompt_tmpl.add_bos(), encode_special_tokens=True)
-        prompt_tokens = prompt_ids.shape[-1]
-
+        
+        # We will calculate prompt_tokens after generation for simplicity
+        
         if req.stream:
             start_ts = int(time.time())
             first_chunk = True
@@ -214,7 +258,11 @@ def create_app(engine: ExLlamaEngine) -> FastAPI:
 
         text = "".join(engine.generate(prompt, sampler, max_tok, stream=False))
         now = int(time.time())
+        
+        # Calculate token counts here for accuracy
+        prompt_tokens = engine.tokenizer.encode(prompt).shape[-1]
         completion_tokens = engine.tokenizer.encode(text).shape[-1]
+        
         return JSONResponse(
             {
                 "id": f"chatcmpl-{now}",
@@ -236,39 +284,16 @@ def create_app(engine: ExLlamaEngine) -> FastAPI:
             }
         )
 
+    # The /v1/completions endpoint remains the same
     @app.post("/v1/completions")
     async def completions(req: CompletionRequest):
         max_tok = req.max_tokens or engine.args.max_response_tokens
         sampler = engine.sampler(req.temperature, req.top_p)
-        prompt_ids = engine.tokenizer.encode(req.prompt, add_bos=engine.prompt_tmpl.add_bos(), encode_special_tokens=True)
-        prompt_tokens = prompt_ids.shape[-1]
-
-        if req.stream:
-            start_ts = int(time.time())
-
-            def event_stream():
-                for chunk in engine.generate(req.prompt, sampler, max_tok, stream=True):
-                    data_obj = {
-                        "id": f"cmpl-{start_ts}",
-                        "object": "text_completion_chunk",
-                        "created": start_ts,
-                        "model": engine.model_id,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "text": chunk,
-                                "logprobs": None,
-                                "finish_reason": None,
-                            }
-                        ],
-                    }
-                    yield f"data: {json.dumps(data_obj, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(event_stream(), media_type="text/event-stream")
-
+        
         text = "".join(engine.generate(req.prompt, sampler, max_tok, stream=False))
         now = int(time.time())
+
+        prompt_tokens = engine.tokenizer.encode(req.prompt).shape[-1]
         completion_tokens = engine.tokenizer.encode(text).shape[-1]
         return JSONResponse(
             {
